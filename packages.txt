@@ -1,4 +1,5 @@
 shiny
+bslib
 readxl
 dplyr
 tidyr
@@ -10,4 +11,5 @@ emmeans
 multcompView
 officer
 DT
-bslib
+rlang
+scales
