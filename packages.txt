@@ -1,0 +1,13 @@
+shiny
+readxl
+dplyr
+tidyr
+stringr
+purrr
+ggplot2
+ordinal
+emmeans
+multcompView
+officer
+DT
+bslib

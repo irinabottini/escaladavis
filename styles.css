@@ -1,0 +1,23 @@
+:root{
+  --bayer-blue:#00A3E0;
+  --bayer-green:#89D329;
+  --violet:#6D4AFF;
+  --violet-soft:#F3F0FF;
+  --ink:#18324A;
+  --muted:#6B7785;
+  --line:#E5EAF0;
+}
+body{background:#f7f9fc;color:var(--ink);font-family:'Segoe UI',Roboto,Arial,sans-serif;}
+.navbar{background:linear-gradient(90deg,var(--violet),var(--bayer-blue));border:none;box-shadow:0 4px 18px rgba(24,50,74,.16);}
+.navbar-default .navbar-brand,.navbar-default .navbar-nav>li>a{color:white!important;font-weight:600;}
+.container-fluid{max-width:100%!important;width:100%!important;padding-left:28px;padding-right:28px;}
+.well{background:white;border:1px solid var(--line);border-radius:18px;box-shadow:0 8px 28px rgba(24,50,74,.06);}
+.btn-primary,.btn-success{border:none;border-radius:12px;font-weight:700;background:linear-gradient(90deg,var(--violet),var(--bayer-blue));}
+.btn-default{border-radius:12px;}
+.help-card{background:linear-gradient(135deg,#fff,var(--violet-soft));border:1px solid var(--line);border-radius:18px;padding:18px;margin-bottom:16px;}
+.metric-card{background:white;border:1px solid var(--line);border-radius:18px;padding:16px;margin:8px 0;box-shadow:0 4px 16px rgba(24,50,74,.05);}
+.metric-card b{font-size:22px;color:var(--violet);}
+.logo-top{height:72px;border-radius:50%;margin-right:14px;}
+.small-note{color:var(--muted);font-size:13px;}
+.table{background:white;}
+pre{border-radius:14px;background:#0f172a;color:#e2e8f0;}
