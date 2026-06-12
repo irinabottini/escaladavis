@@ -1,46 +1,39 @@
 # Escala DAVIS
 
-App Shiny para analizar datos de escala Davis 0-9 desde tablas Scout con conteos por clase.
+Aplicación Shiny para análisis corporativo de Escala DAVIS 0-9 con datos tipo Scout.
 
-## Qué hace
+## Novedades v4
 
-- Carga Excel, CSV o TXT.
-- Permite mapear columnas si los nombres cambian.
-- Filtra `se_name = ES11AD2` y `assessment_type_code = COUNT`.
-- Excluye `ABBOTT` del análisis.
-- Clasifica Davis como:
-  - 0 = Sin Daño
-  - 1-2 = Low Damage
-  - 3-6 = Medium Damage
-  - 7-9 = High Damage
-- Valida que `sum(assessment_value) = sample_size` por `trial + assessment_timing_code + treatment + replicate_number`.
-- Genera análisis overall, por localidad y por grupos manuales de trials.
-- Mantiene modelo ordinal con `ordinal::clm()` usando `weights = assessment_value`.
-- Exporta PowerPoint.
+- Pestaña **Información requerida** con todos los encabezados recomendados para construir la query.
+- Carga por archivo o **copiar y pegar directo desde Excel/Google Sheets**.
+- Tabla descriptiva separada del gráfico para evitar superposición.
+- Exportación PowerPoint ajustada: gráficos en slides independientes y tablas en slides separadas.
+- Modelo ordinal `ordinal::clm()` ponderado por `assessment_value`.
 
-## Estructura recomendada
+## Columnas recomendadas
 
-```text
-app.R
-packages.txt
-README.md
-www/
-  styles.css
-  logo_bayer.jpg   # opcional
-```
+- `trial`
+- `se_name`
+- `assessment_type_code`
+- `assessment_timing_code`
+- `treatment`
+- `treatment_mod`
+- `replicate_number`
+- `assessment_class`
+- `assessment_value`
+- `sample_size`
 
-## Cómo correr localmente
+La app filtra `se_name = ES11AD2` y `assessment_type_code = COUNT`.
+
+## Ejecutar local
 
 ```r
 install.packages(readLines("packages.txt"))
 shiny::runApp()
 ```
 
-## Publicar en shinyapps.io
+## Publicar
 
 ```r
-install.packages("rsconnect")
 rsconnect::deployApp()
 ```
-
-Antes de publicar, probar localmente con el Excel modelo.

@@ -1,483 +1,239 @@
 library(shiny)
 library(bslib)
+library(shinyjs)
+library(DT)
+library(tidyverse)
 library(readxl)
-library(dplyr)
-library(tidyr)
-library(stringr)
-library(purrr)
-library(ggplot2)
+library(readr)
+library(janitor)
 library(ordinal)
 library(emmeans)
 library(multcompView)
 library(officer)
-library(DT)
+library(rvg)
+library(flextable)
 library(scales)
 
-options(shiny.maxRequestSize = 100 * 1024^2)
+options(shiny.maxRequestSize = 80*1024^2)
 
-DAVIS_LEVELS <- c("Sin Daño", "Low Damage", "Medium Damage", "High Damage")
-DAVIS_COLORS <- c("Sin Daño" = "#D1D5DB", "Low Damage" = "#66B512", "Medium Damage" = "#F59E0B", "High Damage" = "#EF4444")
+bayer_cols <- c("Sin Daño"="#1f78b4", "Low Damage"="#66B512", "Medium Damage"="#F5C542", "High Damage"="#D71920")
+level_order <- c("Sin Daño","Low Damage","Medium Damage","High Damage")
 
-find_col <- function(cols, candidates) {
-  hit <- candidates[candidates %in% cols]
-  if (length(hit) > 0) hit[1] else cols[1]
+find_col <- function(nms, candidates){
+  hit <- candidates[candidates %in% nms][1]
+  ifelse(is.na(hit), nms[1], hit)
 }
-
-safe_num <- function(x) suppressWarnings(as.numeric(str_replace_all(as.character(x), ",", ".")))
-
-read_any <- function(path, name) {
-  ext <- tolower(tools::file_ext(name))
-  if (ext %in% c("xlsx", "xls")) {
-    readxl::read_excel(path)
-  } else if (ext == "csv") {
-    read.csv(path, check.names = FALSE)
-  } else {
-    read.delim(path, check.names = FALSE)
+read_any <- function(path){
+  ext <- tools::file_ext(path) |> tolower()
+  if(ext %in% c("xlsx","xls")) readxl::read_excel(path) |> as.data.frame()
+  else readr::read_delim(path, delim=NULL, show_col_types=FALSE) |> as.data.frame()
+}
+read_paste <- function(txt){
+  validate(need(nchar(trimws(txt))>0, "Pegá una tabla para continuar."))
+  # Soporta pegado directo desde Excel/Google Sheets: columnas separadas por TAB y filas por salto de línea.
+  txt <- gsub("\r\n", "\n", txt)
+  txt <- gsub("\r", "\n", txt)
+  out <- try(readr::read_tsv(I(txt), show_col_types=FALSE, na=c("", "NA", "-")) |> as.data.frame(), silent=TRUE)
+  if(inherits(out, "try-error") || ncol(out) < 2){
+    out <- try(readr::read_delim(I(txt), delim=";", show_col_types=FALSE, na=c("", "NA", "-")) |> as.data.frame(), silent=TRUE)
   }
+  if(inherits(out, "try-error") || ncol(out) < 2){
+    out <- readr::read_csv(I(txt), show_col_types=FALSE, na=c("", "NA", "-")) |> as.data.frame()
+  }
+  out
 }
-
-parse_davis_class <- function(x) {
-  suppressWarnings(as.numeric(str_extract(as.character(x), "[0-9]+")))
+classify_davis <- function(x){
+  x <- suppressWarnings(as.numeric(gsub("[^0-9.-]", "", as.character(x))))
+  case_when(x == 0 ~ "Sin Daño", x %in% 1:2 ~ "Low Damage", x %in% 3:6 ~ "Medium Damage", x %in% 7:9 ~ "High Damage", TRUE ~ NA_character_)
 }
-
-classify_davis <- function(score) {
-  case_when(
-    score == 0 ~ "Sin Daño",
-    score %in% 1:2 ~ "Low Damage",
-    score %in% 3:6 ~ "Medium Damage",
-    score %in% 7:9 ~ "High Damage",
-    TRUE ~ NA_character_
-  )
+prep_data <- function(df, map){
+  out <- tibble(
+    trial = as.character(df[[map$trial]]),
+    se_name = as.character(df[[map$se_name]]),
+    assessment_type_code = as.character(df[[map$atype]]),
+    assessment_timing_code = as.character(df[[map$timing]]),
+    treatment = as.character(df[[map$treatment]]),
+    treatment_mod = if(!is.null(map$treatment_mod) && map$treatment_mod %in% names(df)) as.character(df[[map$treatment_mod]]) else as.character(df[[map$treatment]]),
+    replicate_number = as.character(df[[map$rep]]),
+    assessment_class = as.character(df[[map$aclass]]),
+    assessment_value = suppressWarnings(as.numeric(df[[map$avalue]])),
+    sample_size = suppressWarnings(as.numeric(df[[map$ssize]]))
+  ) %>%
+    filter(se_name == "ES11AD2", assessment_type_code == "COUNT") %>%
+    mutate(davis = suppressWarnings(as.numeric(gsub("[^0-9.-]", "", assessment_class))),
+           Damage_Level = factor(classify_davis(davis), levels=level_order),
+           assessment_value = replace_na(assessment_value,0)) %>%
+    filter(!is.na(Damage_Level), davis %in% 0:9)
+  out
 }
-
-make_analysis_df <- function(raw, input) {
-  req(raw)
-  raw %>%
-    transmute(
-      trial = as.character(.data[[input$col_trial]]),
-      se_name = as.character(.data[[input$col_se]]),
-      assessment_type_code = as.character(.data[[input$col_type]]),
-      timing = as.character(.data[[input$col_timing]]),
-      treatment = as.character(.data[[input$col_treatment]]),
-      replicate = as.character(.data[[input$col_rep]]),
-      sample_size = safe_num(.data[[input$col_sample]]),
-      assessment_class = as.character(.data[[input$col_class]]),
-      assessment_value = safe_num(.data[[input$col_value]])
-    ) %>%
-    mutate(
-      davis_score = parse_davis_class(assessment_class),
-      count = assessment_value,
-      damage_level = factor(classify_davis(davis_score), levels = DAVIS_LEVELS, ordered = TRUE)
-    )
+validate_counts <- function(d){
+  d %>% group_by(trial, assessment_timing_code, treatment, treatment_mod, replicate_number) %>%
+    summarise(sample_size = first(sample_size), sum_assessment_value = sum(assessment_value, na.rm=TRUE), difference = sum_assessment_value - sample_size, .groups="drop") %>%
+    mutate(status = ifelse(abs(difference) < 1e-8, "OK", "ERROR"))
 }
-
-validate_counts <- function(df) {
-  df %>%
-    group_by(trial, timing, treatment, replicate) %>%
-    summarise(
-      sample_size = first(sample_size),
-      sum_assessment_value = sum(count, na.rm = TRUE),
-      difference = sum_assessment_value - sample_size,
-      .groups = "drop"
-    ) %>%
-    filter(is.na(sample_size) | is.na(sum_assessment_value) | abs(difference) > 1e-8)
+descriptive_summary <- function(d, xvar="treatment_mod"){
+  req(nrow(d)>0)
+  totals <- d %>% group_by(assessment_timing_code, .data[[xvar]]) %>%
+    summarise(total_plants=sum(assessment_value, na.rm=TRUE), mean_davis=weighted.mean(davis, assessment_value, na.rm=TRUE), .groups="drop")
+  pct <- d %>% group_by(assessment_timing_code, .data[[xvar]], Damage_Level) %>%
+    summarise(n=sum(assessment_value, na.rm=TRUE), .groups="drop") %>%
+    group_by(assessment_timing_code, .data[[xvar]]) %>% mutate(pct=n/sum(n)) %>% ungroup() %>%
+    select(assessment_timing_code, !!xvar := .data[[xvar]], Damage_Level, pct) %>%
+    tidyr::pivot_wider(names_from=Damage_Level, values_from=pct, values_fill=0)
+  out <- totals %>% left_join(pct, by=c("assessment_timing_code", xvar))
+  for(col in level_order){ if(!col %in% names(out)) out[[col]] <- 0 }
+  out %>% mutate(across(all_of(level_order), ~scales::percent(.x, accuracy=0.1)), mean_davis=round(mean_davis,2)) %>%
+    arrange(assessment_timing_code, .data[[xvar]])
 }
-
-make_summary <- function(df) {
-  df %>%
-    filter(!is.na(damage_level), !is.na(count), count > 0) %>%
-    group_by(timing, treatment, damage_level) %>%
-    summarise(n = sum(count, na.rm = TRUE), .groups = "drop_last") %>%
-    mutate(percent = 100 * n / sum(n, na.rm = TRUE)) %>%
-    ungroup()
+column_requirements <- tibble::tribble(
+  ~encabezado_recomendado, ~obligatoria, ~uso_en_la_app, ~regla_esperada,
+  "trial", "Sí", "Identifica ensayo/localidad. Se usa para análisis por localidad y armado de grupos.", "Debe tener un valor por fila. Los grupos se definen seleccionando estos valores.",
+  "se_name", "Sí", "Filtra la variable de evaluación.", "La app usa ES11AD2 para este análisis. Otras se_name se excluyen.",
+  "assessment_type_code", "Sí", "Filtra el tipo de dato.", "Debe ser COUNT. Las filas ABBOTT u otros tipos se excluyen.",
+  "assessment_timing_code", "Sí", "Define el momento de evaluación y las facetas de los gráficos.", "Si no existe con ese nombre, la app permite elegir otra columna en el mapeo.",
+  "treatment", "Sí", "Código base de tratamiento.", "Puede ser T1/T2 o código numérico. También puede usarse como eje X.",
+  "treatment_mod", "Recomendada", "Nombre/código de tratamiento para mostrar en eje X.", "Es la opción recomendada para gráficos. Si no existe, puede mapearse treatment.",
+  "replicate_number", "Sí", "Identifica repetición.", "Se usa en la validación sample_size por repetición.",
+  "assessment_class", "Sí", "Nivel Davis observado.", "Debe contener la clase 0 a 9, por ejemplo CL. 0, CL. 1 ... CL. 9.",
+  "assessment_value", "Sí", "Cantidad de plantas en cada clase Davis.", "Debe ser numérica. Es el peso usado por el modelo ordinal.",
+  "sample_size", "Sí", "Cantidad total de plantas evaluadas para esa combinación.", "La suma de assessment_value por trial + momento + tratamiento + repetición debe coincidir con sample_size."
+)
+plot_stack <- function(d, xvar="treatment_mod", title="", subtitle="", letters_df=NULL){
+  req(nrow(d)>0)
+  pdat <- d %>% group_by(assessment_timing_code, .data[[xvar]], Damage_Level) %>%
+    summarise(n=sum(assessment_value,na.rm=TRUE), .groups="drop_last") %>%
+    mutate(total=sum(n), pct=ifelse(total>0,n/total,0), label=ifelse(pct>=.045, percent(pct, accuracy=1), "")) %>% ungroup()
+  ymax <- pdat %>% group_by(assessment_timing_code, .data[[xvar]]) %>% summarise(y=1.03,.groups="drop")
+  if(!is.null(letters_df) && nrow(letters_df)>0){
+    ymax <- ymax %>% left_join(letters_df, by=setNames(c("assessment_timing_code",xvar), c("assessment_timing_code",xvar)))
+  }
+  ggplot(pdat, aes(x=.data[[xvar]], y=pct, fill=Damage_Level))+
+    geom_col(width=.72, color="white", linewidth=.35)+
+    geom_text(aes(label=label), position=position_stack(vjust=.5), size=3.2, fontface="bold", color="#102A43")+
+    {if(!is.null(letters_df) && nrow(letters_df)>0) geom_text(data=ymax, aes(x=.data[[xvar]], y=y, label=letters), inherit.aes=FALSE, fontface="bold", size=4.3, color="#10384F") }+
+    facet_wrap(~assessment_timing_code, scales="free_x")+
+    scale_fill_manual(values=bayer_cols, breaks=level_order, drop=FALSE)+
+    scale_y_continuous(labels=percent_format(accuracy=1), limits=c(0,1.12), expand=expansion(mult=c(0,.02)))+
+    labs(title=title, subtitle=subtitle, x=NULL, y="Distribución porcentual", fill="Nivel de daño")+
+    theme_minimal(base_size=13)+
+    theme(plot.title=element_text(face="bold", size=18, color="#10384F"), plot.subtitle=element_text(color="#64748B"),
+          axis.text.x=element_text(angle=45,hjust=1, size=9), panel.grid.major.x=element_blank(),
+          legend.position="bottom", strip.text=element_text(face="bold", color="#10384F"), plot.background=element_rect(fill="white", color=NA))
 }
-
-make_descriptive <- function(df) {
-  df %>%
-    filter(!is.na(damage_level), !is.na(count), count > 0) %>%
-    group_by(timing, treatment) %>%
-    summarise(
-      plants = sum(count, na.rm = TRUE),
-      mean_davis = weighted.mean(davis_score, count, na.rm = TRUE),
-      pct_sin_dano = 100 * sum(count[damage_level == "Sin Daño"], na.rm = TRUE) / sum(count, na.rm = TRUE),
-      pct_low = 100 * sum(count[damage_level == "Low Damage"], na.rm = TRUE) / sum(count, na.rm = TRUE),
-      pct_medium = 100 * sum(count[damage_level == "Medium Damage"], na.rm = TRUE) / sum(count, na.rm = TRUE),
-      pct_high = 100 * sum(count[damage_level == "High Damage"], na.rm = TRUE) / sum(count, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    arrange(timing, treatment)
+expand_weighted <- function(d, max_n=60000){
+  d2 <- d %>% filter(assessment_value>0) %>% mutate(w=round(assessment_value))
+  n <- sum(d2$w, na.rm=TRUE)
+  if(n <= max_n) d2[rep(seq_len(nrow(d2)), d2$w), ] else d2
 }
-
-incidence_first_utc <- function(df, utc_name) {
-  req(utc_name)
-  first_by_trial <- df %>%
-    group_by(trial) %>%
-    summarise(first_timing = sort(unique(as.character(timing)))[1], .groups = "drop")
-
-  df %>%
-    inner_join(first_by_trial, by = "trial") %>%
-    filter(as.character(timing) == as.character(first_timing), as.character(treatment) == as.character(utc_name)) %>%
-    group_by(trial, first_timing) %>%
-    summarise(
-      incidence_medium_high = 100 * sum(count[damage_level %in% c("Medium Damage", "High Damage")], na.rm = TRUE) / sum(count, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    arrange(trial)
+tukey_letters <- function(d, xvar="treatment_mod"){
+  res <- map_dfr(unique(d$assessment_timing_code), function(tm){
+    df <- d %>% filter(assessment_timing_code==tm, assessment_value>0)
+    if(n_distinct(df[[xvar]])<2) return(tibble())
+    ex <- expand_weighted(df)
+    fit <- try(aov(davis ~ as.factor(.data[[xvar]]), data=ex, weights=if("w" %in% names(ex)) w else NULL), silent=TRUE)
+    if(inherits(fit,"try-error")) return(tibble())
+    tk <- try(TukeyHSD(fit)[[1]], silent=TRUE)
+    if(inherits(tk,"try-error")) return(tibble())
+    pv <- tk[,"p adj"]; names(pv) <- rownames(tk)
+    lets <- multcompView::multcompLetters(pv)$Letters
+    tibble(assessment_timing_code=tm, !!xvar := names(lets), letters=unname(lets))
+  })
+  res
 }
-
-fit_ordinal <- function(df) {
-  dat <- df %>%
-    filter(!is.na(damage_level), !is.na(count), count > 0) %>%
-    mutate(damage_level = ordered(as.character(damage_level), levels = DAVIS_LEVELS), treatment = factor(treatment))
-  if (n_distinct(dat$damage_level) < 2 || n_distinct(dat$treatment) < 2) return(NULL)
-  tryCatch(ordinal::clm(damage_level ~ treatment, weights = count, data = dat, link = "logit"), error = function(e) NULL)
+ordinal_summary <- function(d, xvar="treatment_mod", control=NULL){
+  map_dfr(unique(d$assessment_timing_code), function(tm){
+    df <- d %>% filter(assessment_timing_code==tm, assessment_value>0, !is.na(Damage_Level))
+    if(n_distinct(df[[xvar]])<2 || n_distinct(df$Damage_Level)<2) return(tibble())
+    df[[xvar]] <- factor(df[[xvar]])
+    fit <- try(ordinal::clm(Damage_Level ~ get(xvar), data=df, weights=assessment_value, link="logit"), silent=TRUE)
+    if(inherits(fit,"try-error")) return(tibble(assessment_timing_code=tm, note="No ajustó CLM"))
+    em <- try(emmeans::emmeans(fit, specs=as.formula(paste("~", xvar))), silent=TRUE)
+    contr <- tibble()
+    if(!inherits(em,"try-error") && !is.null(control) && control %in% levels(df[[xvar]])){
+      contr <- try(as.data.frame(emmeans::contrast(em, method="trt.vs.ctrl", ref=which(levels(df[[xvar]])==control))))
+      if(!inherits(contr,"try-error")) contr <- as_tibble(contr) %>% mutate(assessment_timing_code=tm)
+    }
+    tibble(assessment_timing_code=tm, AIC=AIC(fit), n=sum(df$assessment_value), model="CLM ordinal logit") %>% bind_cols(list(comparisons=list(contr)))
+  })
 }
-
-ordinal_text <- function(df) {
-  mod <- fit_ordinal(df)
-  if (is.null(mod)) return("Modelo ordinal no ajustable. Revisar cantidad de tratamientos, niveles Davis o conteos válidos.")
-  paste(capture.output(summary(mod)), collapse = "\n")
+incidence_control <- function(d, control, xvar="treatment_mod"){
+  first_tm <- sort(unique(d$assessment_timing_code))[1]
+  d %>% filter(assessment_timing_code==first_tm, .data[[xvar]]==control, Damage_Level %in% c("Medium Damage","High Damage")) %>%
+    group_by(trial) %>% summarise(incidence=sum(assessment_value)/sum(d$assessment_value[d$trial==first(trial) & d$assessment_timing_code==first_tm & d[[xvar]]==control], na.rm=TRUE), .groups="drop") %>%
+    mutate(assessment_timing_code=first_tm, incidence=percent(incidence, accuracy=0.1))
 }
+make_ppt <- function(file, plots, val, ord_tab, desc_tab=NULL){
+  ppt <- read_pptx()
+  ppt <- add_slide(ppt, layout="Title Slide", master="Office Theme")
+  ppt <- ph_with(ppt, "Escala DAVIS", location=ph_location_type(type="ctrTitle"))
+  ppt <- ph_with(ppt, "Reporte corporativo - análisis ordinal, validación y gráficos", location=ph_location_type(type="subTitle"))
 
-make_letters <- function(df) {
-  dat <- df %>%
-    filter(!is.na(davis_score), !is.na(count), count > 0) %>%
-    mutate(treatment = factor(treatment))
-  if (n_distinct(dat$treatment) < 2) return(tibble(treatment = unique(dat$treatment), letter = "a"))
+  ppt <- add_slide(ppt, layout="Title and Content", master="Office Theme")
+  ppt <- ph_with(ppt,"Validación de datos",location=ph_location_type(type="title"))
+  ppt <- ph_with(ppt, flextable(head(val,18)) |> fontsize(size=8, part="all") |> autofit(), location=ph_location(left=.45, top=1.15, width=12.4, height=5.8))
 
-  mod <- tryCatch(lm(davis_score ~ treatment, weights = count, data = dat), error = function(e) NULL)
-  if (is.null(mod)) return(tibble(treatment = unique(dat$treatment), letter = NA_character_))
+  for(nm in names(plots)){
+    ppt <- add_slide(ppt, layout="Blank", master="Office Theme")
+    ppt <- ph_with(ppt, nm, location=ph_location(left=.35, top=.18, width=12.6, height=.35))
+    # Gráfico dentro de márgenes 16:9, sin tabla encima.
+    ppt <- ph_with(ppt, rvg::dml(ggobj=plots[[nm]]), location=ph_location(left=.35, top=.68, width=12.65, height=6.35))
+  }
 
-  emm <- tryCatch(emmeans::emmeans(mod, ~ treatment), error = function(e) NULL)
-  if (is.null(emm)) return(tibble(treatment = unique(dat$treatment), letter = NA_character_))
+  if(!is.null(desc_tab) && nrow(desc_tab)>0){
+    ppt <- add_slide(ppt, layout="Title and Content", master="Office Theme")
+    ppt <- ph_with(ppt,"Tabla descriptiva - Overall",location=ph_location_type(type="title"))
+    ppt <- ph_with(ppt, flextable(head(desc_tab,20)) |> fontsize(size=7.5, part="all") |> autofit(), location=ph_location(left=.35, top=1.05, width=12.7, height=5.95))
+  }
 
-  pairs_df <- tryCatch(as.data.frame(pairs(emm, adjust = "tukey")), error = function(e) NULL)
-  if (is.null(pairs_df) || nrow(pairs_df) == 0) return(tibble(treatment = levels(dat$treatment), letter = "a"))
-
-  pvals <- pairs_df$p.value
-  names(pvals) <- gsub(" ", "", pairs_df$contrast)
-  letters <- tryCatch(multcompView::multcompLetters(pvals, threshold = 0.05)$Letters, error = function(e) NULL)
-  if (is.null(letters)) return(tibble(treatment = levels(dat$treatment), letter = NA_character_))
-  tibble(treatment = names(letters), letter = unname(letters))
-}
-
-plot_stack <- function(df, title = "") {
-  s <- make_summary(df)
-  ggplot(s, aes(x = treatment, y = percent, fill = damage_level)) +
-    geom_col(width = 0.72, color = "white", linewidth = 0.18) +
-    facet_wrap(~ timing, scales = "free_x") +
-    scale_fill_manual(values = DAVIS_COLORS, drop = FALSE) +
-    scale_y_continuous(labels = function(x) paste0(x, "%"), limits = c(0, 100), expand = expansion(mult = c(0, .03))) +
-    labs(title = title, x = "Tratamiento", y = "% de plantas", fill = "Nivel Davis") +
-    theme_minimal(base_size = 12) +
-    theme(
-      axis.text.x = element_text(angle = 45, hjust = 1),
-      plot.title = element_text(face = "bold", color = "#4B2E83"),
-      strip.text = element_text(face = "bold"),
-      legend.position = "bottom",
-      panel.grid.minor = element_blank()
-    )
-}
-
-plot_letters <- function(df, title = "") {
-  s <- make_summary(df)
-  lets <- df %>% group_by(timing) %>% group_modify(~ make_letters(.x)) %>% ungroup()
-  ann <- s %>% group_by(timing, treatment) %>% summarise(y = 104, .groups = "drop") %>% left_join(lets, by = c("timing", "treatment"))
-  ggplot(s, aes(x = treatment, y = percent, fill = damage_level)) +
-    geom_col(width = 0.72, color = "white", linewidth = 0.18) +
-    geom_text(data = ann, aes(x = treatment, y = y, label = letter), inherit.aes = FALSE, fontface = "bold", size = 4) +
-    facet_wrap(~ timing, scales = "free_x") +
-    scale_fill_manual(values = DAVIS_COLORS, drop = FALSE) +
-    scale_y_continuous(labels = function(x) paste0(x, "%"), limits = c(0, 112), expand = expansion(mult = c(0, .02))) +
-    labs(title = title, x = "Tratamiento", y = "% de plantas", fill = "Nivel Davis") +
-    theme_minimal(base_size = 12) +
-    theme(
-      axis.text.x = element_text(angle = 45, hjust = 1),
-      plot.title = element_text(face = "bold", color = "#4B2E83"),
-      strip.text = element_text(face = "bold"),
-      legend.position = "bottom",
-      panel.grid.minor = element_blank()
-    )
-}
-
-parse_groups <- function(txt, trials_available) {
-  if (is.null(txt) || !nzchar(txt)) return(tibble(group = character(), trial = character()))
-  lines <- str_split(txt, "\n")[[1]]
-  map_dfr(lines, function(line) {
-    if (!str_detect(line, ":")) return(tibble(group = character(), trial = character()))
-    grp <- str_trim(str_split_fixed(line, ":", 2)[,1])
-    trs <- str_split(str_split_fixed(line, ":", 2)[,2], ",")[[1]] %>% str_trim()
-    tibble(group = grp, trial = trs)
-  }) %>% filter(trial %in% trials_available, nzchar(group), nzchar(trial))
-}
-
-add_text_slide <- function(doc, title, body) {
-  doc <- add_slide(doc, layout = "Title and Content", master = "Office Theme")
-  doc <- ph_with(doc, title, location = ph_location_type(type = "title"))
-  ph_with(doc, body, location = ph_location_type(type = "body"))
-}
-
-add_plot_slide <- function(doc, plot, title, subtitle = NULL) {
-  img <- tempfile(fileext = ".png")
-  ggsave(img, plot, width = 11.2, height = 5.7, dpi = 180)
-  doc <- add_slide(doc, layout = "Title and Content", master = "Office Theme")
-  doc <- ph_with(doc, title, location = ph_location_type(type = "title"))
-  if (!is.null(subtitle)) doc <- ph_with(doc, subtitle, location = ph_location(left = .7, top = 1.02, width = 11.4, height = .35))
-  ph_with(doc, external_img(img, width = 11.2, height = 5.7), location = ph_location(left = .7, top = 1.35, width = 11.2, height = 5.7))
+  ppt <- add_slide(ppt, layout="Title and Content", master="Office Theme")
+  ppt <- ph_with(ppt,"Modelo ordinal",location=ph_location_type(type="title"))
+  ppt <- ph_with(ppt, flextable(head(ord_tab %>% select(-comparisons),20)) |> fontsize(size=8, part="all") |> autofit(), location=ph_location(left=.5, top=1.15, width=12.1, height=5.65))
+  print(ppt, target=file)
 }
 
 ui <- page_navbar(
-  title = "Escala DAVIS",
-  theme = bs_theme(version = 5, bootswatch = "flatly", primary = "#4B2E83", secondary = "#00A3E0", success = "#66B512"),
-  header = tags$head(tags$link(rel = "stylesheet", type = "text/css", href = "styles.css")),
-
-  nav_panel("Inicio",
-    div(class = "hero",
-      h1("Escala DAVIS"),
-      p("Aplicación en espacio de prueba para analizar conteos por clase Davis 0-9. El flujo está pensado para cargar una tabla Scout, validar consistencia, generar análisis overall, por localidad y por grupos manuales, y exportar una presentación PowerPoint."),
-      span(class = "badge-davis badge-zero", "0 = Sin Daño"),
-      span(class = "badge-davis badge-low", "1-2 = Low"),
-      span(class = "badge-davis badge-med", "3-6 = Medium"),
-      span(class = "badge-davis badge-high", "7-9 = High")
-    ),
-    div(class = "kpi-grid",
-      div(class = "kpi-card", div(class="label", "Filtro fijo"), div(class="value", "ES11AD2"), div(class="small-muted", "se_name objetivo")),
-      div(class = "kpi-card", div(class="label", "Tipo de dato"), div(class="value", "COUNT"), div(class="small-muted", "ABBOTT excluido")),
-      div(class = "kpi-card", div(class="label", "Modelo"), div(class="value", "CLM"), div(class="small-muted", "ordinal logit")),
-      div(class = "kpi-card", div(class="label", "Salida"), div(class="value", "PPTX"), div(class="small-muted", "slides editables"))
-    ),
-    div(class = "card-help",
-      h3(class = "help-title", "Cómo usarla"),
-      tags$ol(
-        tags$li("Cargá el Excel o CSV en la pestaña Carga y mapeo."),
-        tags$li("Revisá que cada rol de columna esté correctamente asignado."),
-        tags$li("Elegí el testigo desde la lista de tratamientos detectados."),
-        tags$li("Procesá los datos y revisá la pestaña Validación."),
-        tags$li("Consultá los resultados overall, por localidad y por grupos."),
-        tags$li("Exportá el PowerPoint para usar los gráficos en otras presentaciones.")
-      )
-    )
-  ),
-
-  nav_panel("Carga y mapeo",
-    layout_sidebar(
-      sidebar = sidebar(
-        fileInput("file", "Cargar tabla", accept = c(".xlsx", ".xls", ".csv", ".txt")),
-        uiOutput("mapping_ui"),
-        textInput("target_se", "se_name a analizar", "ES11AD2"),
-        textInput("target_type", "assessment_type_code", "COUNT"),
-        uiOutput("utc_ui"),
-        actionButton("process", "Procesar datos", class = "btn-primary")
-      ),
-      div(class = "card-soft", h3("Vista previa"), DTOutput("preview"))
-    )
-  ),
-
-  nav_panel("Validación",
-    div(class = "card-help",
-      h3(class = "help-title", "Regla de consistencia"),
-      p("Para cada combinación trial + momento + tratamiento + repetición, la suma de assessment_value debe coincidir con sample_size. Si no coincide, el error aparece en la tabla inferior.")
-    ),
-    div(class = "kpi-grid",
-      uiOutput("kpi_rows"), uiOutput("kpi_trials"), uiOutput("kpi_errors"), uiOutput("kpi_incidence")
-    ),
-    div(class = "card-soft", h3("Errores detectados"), DTOutput("validation_table")),
-    div(class = "card-soft", h3("Incidencia del testigo en primera evaluación"), p("Incidencia = % Medium Damage + % High Damage en el testigo, usando el primer assessment_timing_code de cada localidad."), DTOutput("incidence_table"))
-  ),
-
-  nav_panel("Overall",
-    div(class = "card-help", h3(class = "help-title", "Fundamento"), p("El análisis overall combina todos los trials válidos. Sirve como lectura general del comportamiento de los tratamientos, pero no reemplaza la interpretación por localidad si existe interacción ambiente/tratamiento.")),
-    plotOutput("plot_overall", height = "620px"),
-    plotOutput("plot_overall_letters", height = "620px"),
-    div(class = "card-soft", h3("Tabla descriptiva"), DTOutput("desc_overall")),
-    div(class = "card-soft", h3("Modelo ordinal CLM"), pre(textOutput("model_overall")))
-  ),
-
-  nav_panel("Por localidad",
-    div(class = "card-help", h3(class = "help-title", "Lectura por localidad"), p("Cada trial se analiza como subconjunto independiente. Las letras y los modelos de una localidad no deben compararse directamente con letras calculadas para otra localidad.")),
-    uiOutput("trial_selector"),
-    plotOutput("plot_trial", height = "620px"),
-    plotOutput("plot_trial_letters", height = "620px"),
-    div(class = "card-soft", h3("Tabla descriptiva"), DTOutput("desc_trial")),
-    div(class = "card-soft", h3("Modelo ordinal CLM"), pre(textOutput("model_trial")))
-  ),
-
-  nav_panel("Grupos",
-    div(class = "card-help",
-      h3(class = "help-title", "Segmentación manual"),
-      p("Definí grupos de ensayos manualmente. Formato: Nombre del grupo: trial1, trial2, trial3"),
-      p("Ejemplo: Alta presión: ARG001, ARG002")
-    ),
-    layout_columns(
-      col_widths = c(4,8),
-      div(class = "card-soft", h4("Definir grupos"), verbatimTextOutput("available_trials"), textAreaInput("group_text", "Grupos", rows = 8, placeholder = "Alta presión: Trial A, Trial B\nBaja presión: Trial C, Trial D"), uiOutput("group_selector")),
-      div(class = "card-soft", h4("Trials asignados"), DTOutput("groups_table"))
-    ),
-    plotOutput("plot_group", height = "620px"),
-    plotOutput("plot_group_letters", height = "620px"),
-    div(class = "card-soft", h3("Modelo ordinal CLM"), pre(textOutput("model_group")))
-  ),
-
-  nav_panel("? Ayuda y fundamento",
-    div(class = "card-help",
-      h2(class = "help-title", "Columnas necesarias"),
-      tags$ul(
-        tags$li(strong("se_name:"), " debe contener ES11AD2."),
-        tags$li(strong("assessment_type_code:"), " debe contener COUNT. ABBOTT queda excluido."),
-        tags$li(strong("trial:"), " identifica localidad o ensayo."),
-        tags$li(strong("assessment_timing_code:"), " identifica el momento de evaluación."),
-        tags$li(strong("treatment / Trt. / treatment_mod:"), " identifica tratamiento."),
-        tags$li(strong("replicate_number:"), " identifica repetición."),
-        tags$li(strong("sample_size:"), " total de plantas evaluadas."),
-        tags$li(strong("assessment_class:"), " clase Davis, por ejemplo CL. 0 a CL. 9."),
-        tags$li(strong("assessment_value:"), " cantidad de plantas observadas en esa clase.")
-      )
-    ),
-    div(class = "card-soft",
-      h2("Fundamento de las letras"),
-      p("Las letras resumen comparaciones múltiples entre tratamientos. Dos tratamientos que comparten al menos una letra no difieren significativamente para ese subconjunto y momento. Dos tratamientos con letras completamente diferentes sí presentan diferencias significativas bajo el criterio usado."),
-      p("Ejemplo: si T1 = a, T2 = ab y T3 = b, T1 y T3 difieren; T2 queda en posición intermedia y no difiere claramente de T1 ni de T3."),
-      p("En esta app las letras se calculan sobre el score Davis ponderado por conteos. El modelo ordinal CLM se mantiene como salida principal técnica para respetar la línea de presentación del script original.")
-    ),
-    div(class = "card-soft",
-      h2("Modelo ordinal"),
-      p("El modelo ordinal logit acumulativo evalúa la probabilidad de caer en categorías ordenadas de daño. La variable respuesta se trata como ordinal: Sin Daño < Low < Medium < High. Como los datos llegan agregados por clase, se utiliza assessment_value como peso del modelo.")
-    )
-  ),
-
-  nav_panel("Exportar",
-    div(class = "card-help", h3(class = "help-title", "PowerPoint"), p("Genera una presentación con portada, metodología, validación, overall, localidades, grupos definidos y anexos básicos.")),
-    downloadButton("download_ppt", "Descargar PowerPoint", class = "btn-primary")
-  )
+  title=span(class="brand-title", "Escala DAVIS"), theme=bs_theme(version=5, bootswatch="flatly"), header=tags$head(tags$link(rel="stylesheet", href="styles.css")),
+  nav_panel("Inicio", div(class="hero", h1("Escala DAVIS"), p("Análisis corporativo de daño Davis 0-9 para datos Scout. Cargá archivo o pegá tabla, validá conteos, revisá modelos ordinales y exportá gráficos en PowerPoint.")),
+            div(class="kpi", uiOutput("kpis")), div(class="card", h3("Cómo usarla"), tags$ol(tags$li("Cargá o pegá una tabla."), tags$li("Mapeá columnas; el eje X puede ser treatment_mod."), tags$li("Elegí testigo y armá grupos."), tags$li("Revisá gráficos, letras y modelo ordinal."), tags$li("Descargá PowerPoint.")))),
+  nav_panel("Información requerida", div(class="card", h2("¿Qué tabla tengo que traer desde la plataforma?"), p("La aplicación espera una tabla en formato largo: una fila por combinación de ensayo, momento, tratamiento, repetición y clase Davis. Para este análisis se toman únicamente las filas con se_name = ES11AD2 y assessment_type_code = COUNT."), div(class="warning-box", "No incluir como dato principal las filas ABBOTT: reflejan otro cálculo y se excluyen automáticamente del análisis DAVIS por conteos."), h3("Encabezados recomendados para la query"), DTOutput("requirements_table"), hr(), h3("Regla de validación principal"), p("Para cada combinación trial + assessment_timing_code + treatment/treatment_mod + replicate_number, la suma de assessment_value entre las clases Davis debe ser igual a sample_size."), tags$pre("Ejemplo: CL.0 + CL.1 + ... + CL.9 = sample_size"), h3("Clasificación de daño"), tags$ul(tags$li("0 = Sin Daño"), tags$li("1-2 = Low Damage"), tags$li("3-6 = Medium Damage"), tags$li("7-9 = High Damage")))),
+  nav_panel("Carga y mapeo", div(class="card", h3("Cargar información"), p("Podés subir un archivo o copiar la tabla directamente desde Excel/Google Sheets y pegarla en el cuadro. El pegado directo debe incluir la fila de encabezados."), radioButtons("input_mode","Modo de carga", c("Archivo"="file","Copiar y pegar"="paste"), inline=TRUE), conditionalPanel("input.input_mode=='file'", fileInput("file","Archivo Excel/CSV/TXT", accept=c(".xlsx",".xls",".csv",".txt"))), conditionalPanel("input.input_mode=='paste'", textAreaInput("paste_text","Pegá la tabla desde la hoja de cálculo", rows=12, placeholder="Copiá desde Excel incluyendo encabezados y pegá aquí. Ejemplo de columnas: trial, se_name, assessment_type_code, assessment_timing_code, treatment, treatment_mod, replicate_number, assessment_class, assessment_value, sample_size")), actionButton("load_data","Cargar tabla", class="btn-primary")), div(class="card", h3("Mapeo de columnas"), p("Si tu query trae otros nombres de encabezado, elegí aquí qué columna corresponde a cada campo requerido."), uiOutput("mapping_ui"), actionButton("apply_map","Aplicar mapeo", class="btn-primary")), div(class="card", h3("Vista previa"), DTOutput("preview"))),
+  nav_panel("Validación", div(class="card", h3("Control de datos"), uiOutput("validation_msg"), DTOutput("validation_table"))),
+  nav_panel("Configuración", div(class="card", h3("Análisis"), uiOutput("config_ui")), div(class="card", h3("Grupos manuales"), p("Escribí un nombre de grupo y seleccioná los trials incluidos."), textInput("group_name","Nombre del grupo"), uiOutput("group_trials_ui"), actionButton("add_group","Agregar grupo"), DTOutput("groups_table"))),
+  nav_panel("Resultados", div(class="card", h3("Gráfico overall"), plotOutput("plot_overall", height="620px"), downloadButton("dl_overall_png","Descargar PNG")), div(class="card", h3("Tabla descriptiva overall"), p("Se muestra debajo del gráfico para evitar superposición y mantener la lectura clara."), DTOutput("descriptive_table")), div(class="card", h3("Modelo ordinal"), DTOutput("ordinal_table"))),
+  nav_panel("Localidades", div(class="card", h3("Gráficos por localidad"), uiOutput("location_selector"), uiOutput("incidence_box"), plotOutput("plot_location", height="620px"))),
+  nav_panel("Grupos", div(class="card", h3("Gráficos por grupo"), uiOutput("group_selector"), plotOutput("plot_group", height="620px"))),
+  nav_panel("Exportar", div(class="card", h3("PowerPoint"), p("Exporta slides 16:9 con gráficos ajustados al tamaño de diapositiva."), downloadButton("dl_ppt","Descargar PPTX", class="btn-primary"))),
+  nav_panel("? Ayuda", div(class="card", h3("Columnas necesarias"), HTML("<span class='help-pill'>trial</span><span class='help-pill'>se_name</span><span class='help-pill'>assessment_type_code</span><span class='help-pill'>assessment_timing_code</span><span class='help-pill'>treatment / treatment_mod</span><span class='help-pill'>replicate_number</span><span class='help-pill'>assessment_class</span><span class='help-pill'>assessment_value</span><span class='help-pill'>sample_size</span>"), hr(), h4("Fundamento"), p("El modelo principal es ordinal logit con ordinal::clm(), ponderado por assessment_value. Las letras Tukey se calculan sobre score Davis expandido/ponderado y se interpretan por cada momento y segmento: tratamientos que comparten letra no difieren significativamente."))))
 )
 
-server <- function(input, output, session) {
-  raw_data <- reactive({
-    req(input$file)
-    read_any(input$file$datapath, input$file$name)
-  })
-
-  output$mapping_ui <- renderUI({
-    req(raw_data())
-    cols <- names(raw_data())
-    tagList(
-      selectInput("col_trial", "Trial / localidad", cols, selected = find_col(cols, c("trial", "trial_mod", "Trial"))),
-      selectInput("col_se", "se_name", cols, selected = find_col(cols, c("se_name", "SE_NAME"))),
-      selectInput("col_type", "assessment_type_code", cols, selected = find_col(cols, c("assessment_type_code", "assessment_type"))),
-      selectInput("col_timing", "Momento", cols, selected = find_col(cols, c("assessment_timing_code", "assessment_number", "assessment_date"))),
-      selectInput("col_treatment", "Tratamiento", cols, selected = find_col(cols, c("Trt.", "treatment", "treatment_mod", "treatment_name"))),
-      selectInput("col_rep", "Repetición", cols, selected = find_col(cols, c("replicate_number", "rep", "replicate"))),
-      selectInput("col_sample", "sample_size", cols, selected = find_col(cols, c("sample_size", "samplesize"))),
-      selectInput("col_class", "assessment_class", cols, selected = find_col(cols, c("assessment_class", "class"))),
-      selectInput("col_value", "assessment_value", cols, selected = find_col(cols, c("assessment_value", "value")))
-    )
-  })
-
-  output$preview <- renderDT({
-    req(raw_data())
-    datatable(head(raw_data(), 100), options = list(scrollX = TRUE, pageLength = 10))
-  })
-
-  mapped_all <- reactive({
-    req(raw_data(), input$col_trial, input$col_se, input$col_type, input$col_timing, input$col_treatment, input$col_rep, input$col_sample, input$col_class, input$col_value)
-    make_analysis_df(raw_data(), input)
-  })
-
-  output$utc_ui <- renderUI({
-    req(mapped_all())
-    choices <- sort(unique(mapped_all()$treatment))
-    selectInput("utc", "Elegir testigo", choices = choices, selected = choices[1])
-  })
-
-  processed <- eventReactive(input$process, {
-    df <- mapped_all() %>%
-      filter(se_name == input$target_se, assessment_type_code == input$target_type, davis_score %in% 0:9)
-    validate <- validate_counts(df)
-    list(data = df, validation = validate)
-  })
-
-  valid_data <- reactive({ req(processed()); processed()$data })
-  validation_errors <- reactive({ req(processed()); processed()$validation })
-
-  output$kpi_rows <- renderUI({ req(valid_data()); div(class="kpi-card", div(class="label","Filas COUNT válidas"), div(class="value", nrow(valid_data()))) })
-  output$kpi_trials <- renderUI({ req(valid_data()); div(class="kpi-card", div(class="label","Trials"), div(class="value", n_distinct(valid_data()$trial))) })
-  output$kpi_errors <- renderUI({ req(validation_errors()); div(class="kpi-card", div(class="label","Errores sample_size"), div(class="value", nrow(validation_errors()))) })
-  output$kpi_incidence <- renderUI({ req(valid_data(), input$utc); inc <- incidence_first_utc(valid_data(), input$utc); val <- if (nrow(inc) == 0) "-" else paste0(round(mean(inc$incidence_medium_high, na.rm=TRUE),1), "%"); div(class="kpi-card", div(class="label","Incidencia media testigo"), div(class="value", val)) })
-
-  output$validation_table <- renderDT({
-    req(validation_errors())
-    datatable(validation_errors(), options = list(scrollX = TRUE, pageLength = 10))
-  })
-
-  output$incidence_table <- renderDT({
-    req(valid_data(), input$utc)
-    datatable(incidence_first_utc(valid_data(), input$utc), options = list(scrollX = TRUE, pageLength = 10))
-  })
-
-  output$plot_overall <- renderPlot({ req(valid_data()); plot_stack(valid_data(), "Overall - Distribución Davis") })
-  output$plot_overall_letters <- renderPlot({ req(valid_data()); plot_letters(valid_data(), "Overall - Letras Tukey sobre score Davis") })
-  output$desc_overall <- renderDT({ req(valid_data()); datatable(make_descriptive(valid_data()), options = list(scrollX = TRUE, pageLength = 10)) })
-  output$model_overall <- renderText({ req(valid_data()); ordinal_text(valid_data()) })
-
-  output$trial_selector <- renderUI({ req(valid_data()); selectInput("selected_trial", "Localidad / trial", choices = sort(unique(valid_data()$trial))) })
-  trial_data <- reactive({ req(valid_data(), input$selected_trial); valid_data() %>% filter(trial == input$selected_trial) })
-  output$plot_trial <- renderPlot({ req(trial_data()); plot_stack(trial_data(), paste("Trial", input$selected_trial, "- Distribución Davis")) })
-  output$plot_trial_letters <- renderPlot({ req(trial_data()); plot_letters(trial_data(), paste("Trial", input$selected_trial, "- Letras Tukey")) })
-  output$desc_trial <- renderDT({ req(trial_data()); datatable(make_descriptive(trial_data()), options = list(scrollX = TRUE, pageLength = 10)) })
-  output$model_trial <- renderText({ req(trial_data()); ordinal_text(trial_data()) })
-
-  groups_df <- reactive({
-    req(valid_data())
-    parse_groups(input$group_text, sort(unique(valid_data()$trial)))
-  })
-  output$available_trials <- renderText({ req(valid_data()); paste(sort(unique(valid_data()$trial)), collapse = ", ") })
-  output$groups_table <- renderDT({ datatable(groups_df(), options = list(pageLength = 10)) })
-  output$group_selector <- renderUI({
-    g <- groups_df()
-    if (nrow(g) == 0) return(helpText("Todavía no hay grupos válidos."))
-    selectInput("selected_group", "Grupo", choices = sort(unique(g$group)))
-  })
-  group_data <- reactive({
-    req(valid_data(), input$selected_group)
-    trs <- groups_df() %>% filter(group == input$selected_group) %>% pull(trial)
-    valid_data() %>% filter(trial %in% trs)
-  })
-  output$plot_group <- renderPlot({ req(group_data()); plot_stack(group_data(), paste("Grupo", input$selected_group, "- Distribución Davis")) })
-  output$plot_group_letters <- renderPlot({ req(group_data()); plot_letters(group_data(), paste("Grupo", input$selected_group, "- Letras Tukey")) })
-  output$model_group <- renderText({ req(group_data()); ordinal_text(group_data()) })
-
-  output$download_ppt <- downloadHandler(
-    filename = function() paste0("Escala_DAVIS_", Sys.Date(), ".pptx"),
-    content = function(file) {
-      req(valid_data())
-      doc <- read_pptx()
-      doc <- add_text_slide(doc, "Escala DAVIS", paste0("Reporte generado: ", Sys.Date(), "\nFiltro: ", input$target_se, " + ", input$target_type, "\nTestigo: ", input$utc))
-      doc <- add_text_slide(doc, "Metodología", "Se analizan conteos por clase Davis 0-9. Clasificación: 0 = Sin Daño; 1-2 = Low; 3-6 = Medium; 7-9 = High. Los registros ABBOTT quedan excluidos. El modelo ordinal usa ordinal::clm con assessment_value como peso.")
-      doc <- add_text_slide(doc, "Validación", paste0("Filas válidas: ", nrow(valid_data()), "\nTrials: ", n_distinct(valid_data()$trial), "\nErrores sample_size: ", nrow(validation_errors())))
-      doc <- add_plot_slide(doc, plot_stack(valid_data(), "Overall - Distribución Davis"), "Overall")
-      doc <- add_plot_slide(doc, plot_letters(valid_data(), "Overall - Letras Tukey"), "Overall - Letras Tukey")
-
-      inc <- incidence_first_utc(valid_data(), input$utc)
-      for (tr in sort(unique(valid_data()$trial))) {
-        dft <- valid_data() %>% filter(trial == tr)
-        inc_txt <- inc %>% filter(trial == tr)
-        sub <- if (nrow(inc_txt) == 0) "Incidencia testigo primera evaluación: no calculable" else paste0("Incidencia testigo primera evaluación: ", round(inc_txt$incidence_medium_high[1], 1), "%")
-        doc <- add_plot_slide(doc, plot_stack(dft, paste("Trial", tr)), paste("Localidad / trial:", tr), sub)
-        doc <- add_plot_slide(doc, plot_letters(dft, paste("Trial", tr, "- Letras Tukey")), paste("Localidad / trial:", tr, "- Letras"))
-      }
-
-      g <- groups_df()
-      if (nrow(g) > 0) {
-        for (gr in sort(unique(g$group))) {
-          trs <- g %>% filter(group == gr) %>% pull(trial)
-          dfg <- valid_data() %>% filter(trial %in% trs)
-          doc <- add_plot_slide(doc, plot_stack(dfg, paste("Grupo", gr)), paste("Grupo:", gr), paste("Trials:", paste(trs, collapse = ", ")))
-          doc <- add_plot_slide(doc, plot_letters(dfg, paste("Grupo", gr, "- Letras Tukey")), paste("Grupo:", gr, "- Letras"))
-        }
-      }
-      print(doc, target = file)
-    }
-  )
+server <- function(input, output, session){
+  raw <- reactiveVal(NULL); dat <- reactiveVal(NULL); groups <- reactiveVal(tibble(group=character(), trial=character()))
+  output$requirements_table <- renderDT({ datatable(column_requirements, rownames=FALSE, options=list(scrollX=TRUE, pageLength=10, dom='tip')) })
+  observeEvent(input$load_data,{ df <- if(input$input_mode=="file") { req(input$file); read_any(input$file$datapath) } else read_paste(input$paste_text); raw(df) })
+  output$preview <- renderDT({ req(raw()); datatable(head(raw(),100), options=list(scrollX=TRUE,pageLength=8)) })
+  output$mapping_ui <- renderUI({ req(raw()); nms <- names(raw()); tagList(fluidRow(column(4, selectInput("m_trial","Trial/localidad",nms, selected=find_col(nms,c("trial")))), column(4, selectInput("m_se","se_name",nms, selected=find_col(nms,c("se_name")))), column(4, selectInput("m_atype","assessment_type_code",nms, selected=find_col(nms,c("assessment_type_code"))))), fluidRow(column(4, selectInput("m_timing","Momento",nms, selected=find_col(nms,c("assessment_timing_code")))), column(4, selectInput("m_treat","Treatment",nms, selected=find_col(nms,c("treatment","Trt.","trt")))), column(4, selectInput("m_treatmod","Treatment para eje X",nms, selected=find_col(nms,c("treatment_mod","treatment","Trt."))))), fluidRow(column(4, selectInput("m_rep","Repetición",nms, selected=find_col(nms,c("replicate_number","rep")))), column(4, selectInput("m_aclass","assessment_class",nms, selected=find_col(nms,c("assessment_class")))), column(4, selectInput("m_avalue","assessment_value",nms, selected=find_col(nms,c("assessment_value"))))), fluidRow(column(4, selectInput("m_ssize","sample_size",nms, selected=find_col(nms,c("sample_size")))))) })
+  observeEvent(input$apply_map,{ req(raw()); map <- list(trial=input$m_trial,se_name=input$m_se,atype=input$m_atype,timing=input$m_timing,treatment=input$m_treat,treatment_mod=input$m_treatmod,rep=input$m_rep,aclass=input$m_aclass,avalue=input$m_avalue,ssize=input$m_ssize); dat(prep_data(raw(),map)) })
+  val <- reactive({ req(dat()); validate_counts(dat()) })
+  output$validation_msg <- renderUI({ req(val()); er <- sum(val()$status=="ERROR"); if(er==0) div(class="ok-box", "Validación OK: todas las sumas por trial + momento + tratamiento + repetición coinciden con sample_size.") else div(class="warning-box", paste("Hay",er,"combinaciones con diferencias contra sample_size.")) })
+  output$validation_table <- renderDT({ req(val()); datatable(val(), options=list(scrollX=TRUE,pageLength=10)) })
+  output$config_ui <- renderUI({ req(dat()); tagList(fluidRow(column(4, selectInput("xvar","Eje X", c("treatment_mod","treatment"), selected="treatment_mod")), column(4, selectInput("control","Testigo", sort(unique(dat()$treatment_mod)))), column(4, checkboxGroupInput("analyses","Salidas", c("Overall","Por localidad","Por grupos"), selected=c("Overall","Por localidad","Por grupos")))) ) })
+  output$group_trials_ui <- renderUI({ req(dat()); selectizeInput("group_trials","Trials", choices=sort(unique(dat()$trial)), multiple=TRUE) })
+  observeEvent(input$add_group,{ req(input$group_name, input$group_trials); groups(bind_rows(groups(), tibble(group=input$group_name, trial=input$group_trials))) })
+  output$groups_table <- renderDT({ datatable(groups(), options=list(pageLength=8)) })
+  letters_all <- reactive({ req(dat(), input$xvar); tukey_letters(dat(), input$xvar) })
+  overall_plot <- reactive({ req(dat(), input$xvar); plot_stack(dat(), input$xvar, "Distribución de daño Davis - Overall", "Barras apiladas con % y letras Tukey por momento", letters_all()) })
+  output$plot_overall <- renderPlot({ overall_plot() }, res=120)
+  desc_overall <- reactive({ req(dat(), input$xvar); descriptive_summary(dat(), input$xvar) })
+  output$descriptive_table <- renderDT({ req(desc_overall()); datatable(desc_overall(), rownames=FALSE, options=list(scrollX=TRUE, pageLength=10)) })
+  output$dl_overall_png <- downloadHandler(filename=function()"overall_davis.png", content=function(file){ ggsave(file, overall_plot(), width=13, height=7.2, dpi=220) })
+  ord <- reactive({ req(dat(), input$xvar); ordinal_summary(dat(), input$xvar, input$control) })
+  output$ordinal_table <- renderDT({ req(ord()); datatable(ord() %>% select(-comparisons), options=list(scrollX=TRUE)) })
+  output$location_selector <- renderUI({ req(dat()); selectInput("sel_trial","Localidad", sort(unique(dat()$trial))) })
+  output$incidence_box <- renderUI({ req(dat(), input$control); inc <- incidence_control(dat(), input$control, input$xvar) %>% filter(trial==input$sel_trial); div(class="ok-box", paste0("Incidencia testigo en primera evaluación (Medium + High): ", ifelse(nrow(inc), inc$incidence, "sin datos"))) })
+  output$plot_location <- renderPlot({ req(input$sel_trial); dd <- dat()%>%filter(trial==input$sel_trial); lets <- tukey_letters(dd,input$xvar); plot_stack(dd,input$xvar,paste("Localidad:",input$sel_trial),"% por nivel de daño + letras Tukey",lets) }, res=120)
+  output$group_selector <- renderUI({ req(groups()); selectInput("sel_group","Grupo", unique(groups()$group)) })
+  output$plot_group <- renderPlot({ req(input$sel_group); tr <- groups()%>%filter(group==input$sel_group)%>%pull(trial); dd <- dat()%>%filter(trial %in% tr); lets <- tukey_letters(dd,input$xvar); plot_stack(dd,input$xvar,paste("Grupo:",input$sel_group),"Trials seleccionados manualmente",lets) }, res=120)
+  output$kpis <- renderUI({ if(is.null(dat())) return(tagList(div(class="kpi-box", b("-"), span("Trials")),div(class="kpi-box", b("-"), span("Tratamientos")),div(class="kpi-box", b("-"), span("Momentos")))); d<-dat(); tagList(div(class="kpi-box", b(n_distinct(d$trial)), span("Trials")), div(class="kpi-box", b(n_distinct(d$treatment_mod)), span("Tratamientos")), div(class="kpi-box", b(n_distinct(d$assessment_timing_code)), span("Momentos")), div(class="kpi-box", b(sum(d$assessment_value,na.rm=TRUE)), span("Plantas evaluadas"))) })
+  output$dl_ppt <- downloadHandler(filename=function() paste0("Escala_DAVIS_Reporte_",Sys.Date(),".pptx"), content=function(file){ req(dat()); plots <- list("Overall"=overall_plot()); for(tr in unique(dat()$trial)){ dd<-dat()%>%filter(trial==tr); plots[[paste("Localidad",tr)]] <- plot_stack(dd,input$xvar,paste("Localidad:",tr),"% por nivel de daño + letras Tukey",tukey_letters(dd,input$xvar)) }; for(gr in unique(groups()$group)){ tr<-groups()%>%filter(group==gr)%>%pull(trial); dd<-dat()%>%filter(trial %in% tr); plots[[paste("Grupo",gr)]]<-plot_stack(dd,input$xvar,paste("Grupo:",gr),"Trials seleccionados",tukey_letters(dd,input$xvar))}; make_ppt(file, plots, val(), ord(), desc_overall()) })
 }
-
 shinyApp(ui, server)
