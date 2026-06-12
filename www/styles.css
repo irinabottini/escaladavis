@@ -15,3 +15,10 @@ body{background:var(--bg); color:var(--text); font-family:Inter,Segoe UI,Roboto,
 textarea.form-control{font-family:Consolas,monospace; font-size:12px}.warning-box{background:#fff7ed;border-left:6px solid #f97316;padding:12px;border-radius:12px}.ok-box{background:#f0fdf4;border-left:6px solid #22c55e;padding:12px;border-radius:12px}
 .small-note{font-size:12px;color:var(--muted)}
 .plot-card img{max-width:100%; border-radius:16px; box-shadow:0 12px 26px rgba(15,23,42,.08)}
+
+/* v4 refinements */
+.help-pill{display:inline-block;background:#eef6ff;color:#10384F;border:1px solid #c7def3;border-radius:999px;padding:6px 10px;margin:4px;font-weight:700;font-size:13px}
+.warning-box{background:#fff8e6;border-left:5px solid #f5c542;padding:12px 14px;border-radius:10px;margin:10px 0;color:#4a3a00}
+.ok-box{background:#eefaf0;border-left:5px solid #66B512;padding:12px 14px;border-radius:10px;margin:10px 0;color:#123b16}
+.card h2,.card h3{color:#10384F;font-weight:800}
+textarea.form-control{font-family:Consolas,monospace;font-size:12px;min-height:280px}
